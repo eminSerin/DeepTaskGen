@@ -9,7 +9,6 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
 
 path = op.abspath(op.join(op.dirname(__file__), ".."))
 if path not in sys.path:
@@ -62,6 +61,8 @@ def train(args):
         num_samples=args.n_samples_per_subj,
         mask=args.mask,
         unmask=unmask,
+        random_state=args.seed,
+        precision=args.precision,
     )
 
     train_loader = args._dataloader(
@@ -69,7 +70,7 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.n_workers,
-        drop_last=True,
+        drop_last=False,
     )
 
     if args.run_validation:
@@ -80,6 +81,7 @@ def train(args):
             num_samples=args.n_samples_per_subj,
             mask=args.mask,
             unmask=unmask,
+            precision=args.precision,
         )
 
         val_loader = args._dataloader(
@@ -87,7 +89,7 @@ def train(args):
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.n_workers,
-            drop_last=True,
+            drop_last=False,
         )
 
     """Init Model"""
@@ -137,22 +139,38 @@ def train(args):
         mode="min",
         # save_last=True,
     )
-    checkpoint_callback_r2 = ModelCheckpoint(
-        monitor="val/r2",
+    checkpoint_callback_corr = ModelCheckpoint(
+        monitor="val/corr",
         dirpath=args.working_dir,
-        filename="best_r2",
+        filename="best_corr",
         save_top_k=1,
         mode="max",
     )
+    checkpoint_callback_diag_index = ModelCheckpoint(
+        monitor="val/diag_index_norm",
+        dirpath=args.working_dir,
+        filename="best_diag_index_norm",
+        save_top_k=1,
+        mode="max",
+    )
+
     lr_monitor = LearningRateMonitor(logging_interval="step")
     callbacks = [
         checkpoint_callback_loss,
-        checkpoint_callback_r2,
+        checkpoint_callback_corr,
+        checkpoint_callback_diag_index,
         lr_monitor,
         SaveLastModel(),
     ]
-    if isinstance(args.loss, RCLossAnneal) or isinstance(args.loss, RCLossV2):
-        callbacks.append(LogReconContrastLoss())
+
+    if args.checkpoint_interval is not None:
+        checkpoint_callback_interval = ModelCheckpoint(
+            dirpath=op.join(args.working_dir, "checkpoints"),
+            filename="{epoch}",
+            save_top_k=-1,
+            every_n_epochs=args.checkpoint_interval,
+        )
+        callbacks.append(checkpoint_callback_interval)
 
     # Logger
     if args.logger == "tensorboard":
@@ -181,14 +199,12 @@ def train(args):
 
     ## TODO: Add multiple GPU support!
     trainer = pl.Trainer(
-        # max_epochs=2,
         max_epochs=args.n_epochs,
         accelerator=args.device,
         default_root_dir=args.working_dir,
         callbacks=callbacks,
         logger=logger,
-        # limit_train_batches=1,
-        # limit_val_batches=1,
+        precision=args.precision,
     )
     if args.run_validation:
         trainer.fit(

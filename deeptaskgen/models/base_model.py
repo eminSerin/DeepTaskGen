@@ -2,7 +2,12 @@ import torch.nn.functional as F
 from torch import optim
 
 try:
-    from deeptaskgen.losses.loss_metric import corrcoef, r2_score
+    from deeptaskgen.losses.loss_metric import (
+        contrastive_loss,
+        corrcoef,
+        diag_index,
+        r2_score,
+    )
 except ImportError:
     import os.path as op
     import sys
@@ -13,7 +18,7 @@ except ImportError:
     del sys, path
     from losses.loss_metric import corrcoef, r2_score
 
-from .utils import _activation_fn, _BaseLayer
+from .utils import _BaseLayer
 
 
 class BaseModel(_BaseLayer):
@@ -66,7 +71,12 @@ class BaseModel(_BaseLayer):
         loss_fn=F.mse_loss,
         optimizer=optim.Adam,
         lr=1e-3,
-        add_loss={"corrcoef": corrcoef, "r2": r2_score},
+        add_loss={
+            "corrcoef": corrcoef,
+            "r2": r2_score,
+            "contrastive": contrastive_loss,
+            "diag_index": diag_index,
+        },
         batch_norm=True,
         lr_scheduler=True,
     ) -> None:
@@ -94,14 +104,14 @@ class BaseModel(_BaseLayer):
         x, y = batch
         y_hat = self(x)
         loss = self.loss_fn(y_hat, y)
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False)
+        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         for name, fn in self.add_loss.items():
             self.log(
                 f"train/{name}",
                 fn(y_hat, y),
                 prog_bar=True,
-                on_step=True,
-                on_epoch=False,
+                on_step=False,
+                on_epoch=True,
             )
         return loss
 

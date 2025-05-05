@@ -6,21 +6,16 @@ import torch
 from torch.utils.data import DataLoader
 
 from deeptaskgen import models
-from deeptaskgen.datasets.taskgen_dataset import (
-    AverageDataLoader,
-    ResidualizedDataloader,
-)
 from deeptaskgen.losses.loss_metric import (
     R2,
-    BetweenMSELoss,
-    HuberLoss,
+    ContrastiveLoss,
+    CRRLoss,
+    DiagIndex,
     MAELoss,
-    MSELogVarLoss,
     MSELoss,
-    MSLELoss,
     PearsonCorr,
     RCLossAnneal,
-    RCLossV2,
+    RelativeDiagIndex,
 )
 
 
@@ -83,8 +78,14 @@ def default_parser():
     parser.add_argument(
         "--architecture",
         type=str,
-        choices=["resunet", "unet", "unetminimal", "vae"],
-        default="unetminimal",
+        choices=[
+            "resunet",
+            "unet",
+            "unetminimal",
+            "attentionunet",
+            "attentionunetminimal",
+        ],
+        default="attentionunet",
         help="Model architecture",
     )
 
@@ -99,7 +100,7 @@ def default_parser():
     parser.add_argument(
         "--n_conv_layers",
         type=int,
-        default=3,
+        default=1,
         help="Number of convolutional layers in each block",
     )
 
@@ -122,7 +123,7 @@ def default_parser():
     parser.add_argument(
         "--max_depth",
         type=int,
-        default=5,
+        default=1,
         help="Maximum depth of encoder and decoder networks",
     )
 
@@ -175,9 +176,9 @@ def default_parser():
     parser.add_argument(
         "--loss",
         type=str,
-        choices=["rc", "mse", "mae", "msle", "huber", "rc_v2", "mse_var"],
-        default="mse",
-        help="Loss function, default=mse",
+        choices=["rc", "mse", "mae", "crr"],
+        default="crr",
+        help="Loss function, default=crr",
     )
 
     parser.add_argument(
@@ -190,7 +191,7 @@ def default_parser():
     parser.add_argument(
         "--optimizer",
         type=str,
-        choices=["adam", "lbfgs", "sgd"],
+        choices=["adam", "lbfgs", "sgd", "adamw"],
         default="adam",
         help="Optimizer, default=adam",
     )
@@ -232,6 +233,13 @@ def default_parser():
     )
 
     parser.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=None,
+        help="Interval for checkpointing, default=None",
+    )
+
+    parser.add_argument(
         "--init_within_subj_margin",
         type=float,
         default=0.5,
@@ -269,7 +277,7 @@ def default_parser():
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.05,
+        default=0.25,
         help="Alpha weight for contrastive loss, default=0.05",
     )
 
@@ -277,6 +285,21 @@ def default_parser():
         "--mask",
         type=str,
         help="Mask to use reconstruct fMRI images, if extracted timeseries were provided.",
+    )
+
+    parser.add_argument(
+        "--pred_mask",
+        type=str,
+        default=None,
+        help="Mask to use maskout areas from predicted images. This is necessary if loss_mask is used during training.",
+    )
+
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="32",
+        choices=["16", "32", "bf16"],
+        help="Precision to use, default=32",
     )
 
     parser.add_argument("--checkpoint_file", type=str, help="Path to checkpoint file")
@@ -301,8 +324,6 @@ def default_parser():
     args.lr_scheduler = boolean_string(args.lr_scheduler)
     args.run_validation = boolean_string(args.run_validation)
     args.freeze_final_layer = boolean_string(args.freeze_final_layer)
-    args.predict_residual = boolean_string(args.predict_residual)
-    args.predict_mean = boolean_string(args.predict_mean)
 
     args._hparams = {
         "conv_dim": args.conv_dim,
@@ -325,22 +346,10 @@ def default_parser():
     _loss = args.loss
     if args.loss == "mse":
         args.loss = MSELoss(mask=args.loss_mask)
-    elif args.loss == "msle":
-        args.loss = MSLELoss(mask=args.loss_mask)
     elif args.loss == "mae":
         args.loss = MAELoss(mask=args.loss_mask)
-    elif args.loss == "huber":
-        args.loss = HuberLoss(mask=args.loss_mask)
-    elif args.loss == "rc_v2":
-        args._hparams["init_within_subj_margin"] = args.init_within_subj_margin
-        args._hparams["alpha"] = args.alpha
-        args.loss = RCLossV2(
-            margin=args.init_within_subj_margin,
-            mask=args.loss_mask,
-            alpha=args.alpha,
-        )
-    elif args.loss == "mse_var":
-        args.loss = MSELogVarLoss(mask=args.loss_mask)
+    elif args.loss == "crr":
+        args.loss = CRRLoss(mask=args.loss_mask)
     elif args.loss == "rc":
         args._hparams["init_within_subj_margin"] = args.init_within_subj_margin
         args._hparams["init_across_subj_margin"] = args.init_across_subj_margin
@@ -361,7 +370,11 @@ def default_parser():
     args.add_loss = {
         "corr": PearsonCorr(mask=args.loss_mask),
         "r2": R2(mask=args.loss_mask),
-        "between_mse": BetweenMSELoss(mask=args.loss_mask),
+        "contrast_loss": ContrastiveLoss(mask=args.loss_mask),
+        "recon_loss": MSELoss(mask=args.loss_mask),
+        "diag_index": DiagIndex(mask=args.loss_mask),
+        "relative_diag_index": RelativeDiagIndex(mask=args.loss_mask),
+        "diag_index_norm": DiagIndex(mask=args.loss_mask, normalize=True),
     }
 
     # Version
@@ -371,6 +384,8 @@ def default_parser():
     # Optimizer
     if args.optimizer == "adam":
         args.optimizer = torch.optim.Adam
+    elif args.optimizer == "adamw":
+        args.optimizer = torch.optim.AdamW
     elif args.optimizer == "lbfgs":
         args.optimizer = torch.optim.LBFGS
     elif args.optimizer == "sgd":
@@ -385,8 +400,14 @@ def default_parser():
         args.architecture = getattr(models.unet, f"UNet{args.conv_dim}D")
     elif args.architecture == "unetminimal":
         args.architecture = getattr(models.unet, f"UNet{args.conv_dim}DMinimal")
-    elif args.architecture == "vnet":
-        args.architecture = getattr(models.vnet, f"VNet{args.conv_dim}D")
+    elif args.architecture == "attentionunet":
+        args.architecture = getattr(models.unet, f"AttentionUNet{args.conv_dim}D")
+    elif args.architecture == "attentionunetminimal":
+        args.architecture = getattr(
+            models.unet, f"AttentionUNet{args.conv_dim}DMinimal"
+        )
+    else:
+        raise ValueError(f"Architecture {args.architecture} not supported")
 
     # DataLoader
     args._dataloader = DataLoader

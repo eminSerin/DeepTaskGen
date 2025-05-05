@@ -1,4 +1,5 @@
-import numpy as np
+from itertools import combinations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,9 +31,75 @@ def corrcoef_loss(input, target):
     return 1 - corrcoef(input, target)
 
 
-def between_mse(input, target):
-    """Computes the mean squared error between the input and the flipped target, aiming to maximize the difference between predicted values and target values of other subjects in a given batch"""
-    return FM.mean_squared_error(input, torch.flip(target, dims=[0]))
+def corrcoef_subj(input, target, eps=1e-8):
+    """Compute the correlation coefficient between sets of subjects.
+    2D Input matrix must be of shape (n_subjects, n_voxels).
+    """
+    if input.ndim != 2 or target.ndim != 2:
+        input = input.reshape(input.shape[0], -1)
+        target = target.reshape(target.shape[0], -1)
+
+    # Center the rows
+    A_mA = input - input.mean(dim=1, keepdim=True)
+    B_mB = target - target.mean(dim=1, keepdim=True)
+
+    # Dot products for numerator
+    numerator = torch.einsum("ij,kj->ik", A_mA, B_mB)
+
+    # Rowwise sum of squares for denominator
+    ssA = torch.einsum("ij,ij->i", A_mA, A_mA)
+    ssB = torch.einsum("ij,ij->i", B_mB, B_mB)
+    denominator = torch.sqrt(torch.clamp(ssA[:, None] * ssB[None, :], min=eps))
+
+    return numerator / denominator
+
+
+def diag_index(input, target, eps=1e-8, normalize=False):
+    """
+    Compute the diagonal index of a correlation matrix.
+    The diagonal index is the difference between the mean of the diagonal elements and the mean of the off-diagonal elements.
+    """
+    corr_mat = corrcoef_subj(input, target, eps)
+    n_subj, _ = corr_mat.shape
+    diag_elements = torch.diagonal(corr_mat).mean()
+    mask = ~torch.eye(
+        n_subj, dtype=torch.bool, device=corr_mat.device
+    )  # (n_subj, n_subj)
+    off_diag_elements = corr_mat[mask].mean()
+    diag_index = diag_elements - off_diag_elements
+    if normalize:
+        return diag_index * diag_elements
+    return diag_index
+
+
+def relative_diag_index(input, target, eps=1e-8):
+    """Computes the relative diagonal index as a percentage of off-diagonal mean."""
+    corr_mat = corrcoef_subj(input, target, eps)
+    n_subj, _ = corr_mat.shape
+    diag_elements = torch.diagonal(corr_mat).mean()
+    mask = ~torch.eye(
+        n_subj, dtype=torch.bool, device=corr_mat.device
+    )  # (n_subj, n_subj)
+    off_diag_elements = corr_mat[mask].mean()
+    diag_index = diag_elements - off_diag_elements
+    return diag_index * 100 / off_diag_elements
+
+
+def contrastive_loss(input, target):
+    """Adaptation of the contrastive loss from Ngo et al., 2022.
+    It can be used with more than 2 subjects."""
+    n_samples = input.shape[0]
+    if n_samples < 2:
+        raise ValueError(
+            "Not enough samples to compute contrastive loss, there must be at least 2 samples"
+        )
+    contrastive_loss = 0
+    count = 0
+    for i, j in combinations(range(n_samples), 2):
+        contrastive_loss += FM.mean_squared_error(input[i], target[j])
+        count += 1
+    contrastive_loss /= count
+    return contrastive_loss
 
 
 def dice(input, target):
@@ -41,21 +108,6 @@ def dice(input, target):
 
 def dice_auc(input, target):
     raise NotImplementedError
-
-
-def vae_loss(input, target, mu, logvar):
-    """Variational Autoencoder Loss."""
-    recon_loss = F.mse_loss(input, target)
-    kld_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    return recon_loss + kld_loss
-
-
-def mse_logvar_loss(input, target, var_ratio=0.1):
-    """Combine MSE loss and logvar loss."""
-    return (
-        F.mse_loss(input, target) * (1 - var_ratio)
-        - torch.log(torch.var(input, dim=0).sum()) * var_ratio
-    )
 
 
 def rc_loss(input, target, within_margin=0, between_margin=0):
@@ -86,7 +138,7 @@ def rc_loss(input, target, within_margin=0, between_margin=0):
             "Input and target must have at least 2 samples! Otherwise it cannot compute contrastive loss."
         )
     recon_loss = FM.mean_squared_error(input, target)
-    contrast_loss = FM.mean_squared_error(input, torch.flip(target, dims=[0]))
+    contrast_loss = contrastive_loss(input, target)
     return torch.clamp(recon_loss - within_margin, min=0.0) + torch.clamp(
         recon_loss - contrast_loss + between_margin, min=0.0
     )
@@ -111,51 +163,14 @@ class BaseLoss(nn.Module):
         return self.loss_fn(input, target)
 
 
-class VAELoss(BaseLoss):
-    def __init__(self, mask=None):
-        super().__init__(mask=mask, loss_fn=vae_loss)
-
-    def forward(self, input, target, mu, logvar):
-        if self.mask is not None:
-            return self.loss_fn(
-                self.mask.apply_mask(input), self.mask.apply_mask(target), mu, logvar
-            )
-        return self.loss_fn(input, target, mu, logvar)
-
-
-class MSELogVarLoss(BaseLoss):
-    def __init__(self, mask=None, var_ratio=0.1):
-        super().__init__(mask=mask, loss_fn=mse_logvar_loss)
-        self.var_ratio = var_ratio
-
-    def forward(self, input, target):
-        if self.mask is not None:
-            return self.loss_fn(
-                self.mask.apply_mask(input),
-                self.mask.apply_mask(target),
-                self.var_ratio,
-            )
-        return self.loss_fn(input, target, self.var_ratio)
-
-
 class MSELoss(BaseLoss):
     def __init__(self, mask=None):
         super().__init__(mask=mask, loss_fn=nn.functional.mse_loss)
 
 
-class BetweenMSELoss(BaseLoss):
-    def __init__(self, mask=None):
-        super().__init__(mask=mask, loss_fn=between_mse)
-
-
 class MAELoss(BaseLoss):
     def __init__(self, mask=None):
         super().__init__(mask=mask, loss_fn=nn.functional.l1_loss)
-
-
-class HuberLoss(BaseLoss):
-    def __init__(self, mask=None):
-        super().__init__(mask=mask, loss_fn=nn.functional.huber_loss)
 
 
 class MSLELoss(BaseLoss):
@@ -176,8 +191,27 @@ class PearsonCorr(nn.Module):
             input = self.mask.apply_mask(input)
             target = self.mask.apply_mask(target)
         if self.loss:
-            return corrcoef_loss(input, target)
+            return 1 - corrcoef(input, target)
         return corrcoef(input, target)
+
+
+class ContrastiveLoss(BaseLoss):
+    def __init__(self, mask=None):
+        super().__init__(mask=mask, loss_fn=contrastive_loss)
+
+
+class DiagIndex(BaseLoss):
+    def __init__(self, mask=None, normalize=False):
+        super().__init__(mask=mask, loss_fn=diag_index)
+        self.normalize = normalize
+
+    def forward(self, input, target):
+        return self.loss_fn(input, target, normalize=self.normalize)
+
+
+class RelativeDiagIndex(BaseLoss):
+    def __init__(self, mask=None):
+        super().__init__(mask=mask, loss_fn=relative_diag_index)
 
 
 class R2(nn.Module):
@@ -197,41 +231,6 @@ class R2(nn.Module):
         return r2_score(input, target)
 
 
-class RCLossV2(nn.Module):
-    """
-    Initializes the RCLossV2 module.
-
-    Args:
-        margin (float): The margin value for the reconstruction loss.
-        mask (torch.Tensor or None, optional): A mask tensor to apply to the loss. Defaults to None.
-    """
-
-    def __init__(self, margin, alpha=0.05, mask=None) -> None:
-        super().__init__()
-        self.margin = margin
-        self.alpha = alpha
-        if mask is not None:
-            self.mask = MaskTensor(mask)
-
-    def forward(self, input, target):
-        """
-        Calculates the contrastive reconstructive loss for the given inputs.
-
-        Args:
-            input (torch.Tensor): The predicted input tensor.
-            target (torch.Tensor): The target input tensor.
-
-        Returns:
-            torch.Tensor: The total loss value.
-        """
-        if hasattr(self, "mask"):
-            input = self.mask.apply_mask(input)
-            target = self.mask.apply_mask(target)
-        self.recon_loss = torch.clamp(F.mse_loss(input, target) - self.margin, min=0)
-        self.contrast_loss = -F.mse_loss(input, torch.flip(target, dims=[0]))
-        return self.recon_loss * (1 - self.alpha) + self.contrast_loss * self.alpha
-
-
 class RCLossAnneal(nn.Module):
     """Reconstruction and Contrastive Loss with Annealing.
 
@@ -249,9 +248,6 @@ class RCLossAnneal(nn.Module):
         Maximum between subject (contrastive) margin, by default 10
     margin_anneal_step : int, optional
         The number of epochs should be done before margin annealing happens, by default 10
-    alpha : float, optional
-        The weight of the reconstructive loss, by default 0.5
-        1.0: only reconstructive loss
     mask : torch.Tensor, optional
         Mask tensor, by default None.
 
@@ -269,7 +265,6 @@ class RCLossAnneal(nn.Module):
         min_within_margin=1.0,
         max_between_margin=10,
         margin_anneal_step=10,
-        alpha=0.5,
         mask=None,
     ):
         super().__init__()
@@ -280,7 +275,6 @@ class RCLossAnneal(nn.Module):
         self.margin_anneal_step = margin_anneal_step
         self.within_margin = init_within_margin
         self.between_margin = init_between_margin
-        self.alpha = alpha
         self.mask = mask
         if mask is not None:
             self.mask = MaskTensor(mask)
@@ -288,17 +282,15 @@ class RCLossAnneal(nn.Module):
 
     def update_margins(self, epoch):
         if (epoch % self.margin_anneal_step == 0) & (epoch > 0):
-            self.within_margin = np.max(
-                [
-                    self.within_margin - self.within_margin * 0.1,
-                    self.min_within_margin,
-                ]
+            steps = epoch // self.margin_anneal_step
+
+            self.within_margin = torch.max(
+                torch.tensor(self.within_margin * 0.5**steps),
+                torch.tensor(self.min_within_margin),
             )
-            self.between_margin = np.min(
-                [
-                    self.between_margin + self.between_margin * 0.1,
-                    self.max_between_margin,
-                ],
+            self.between_margin = torch.min(
+                torch.tensor(self.between_margin * 2.0**steps),
+                torch.tensor(self.max_between_margin),
             )
 
     def _rc_loss(self, input, target, within_margin, between_margin):
@@ -307,14 +299,9 @@ class RCLossAnneal(nn.Module):
         See deeptaskgen.loss.rc_loss for more details.
         """
         self.recon_loss = FM.mean_squared_error(input, target)
-        self.contrast_loss = FM.mean_squared_error(input, torch.flip(target, dims=[0]))
-        return (
-            torch.clamp(self.recon_loss - within_margin, min=0.0) * self.alpha
-            + torch.clamp(
-                self.recon_loss - self.contrast_loss + between_margin, min=0.0
-            )
-            * (1 - self.alpha)
-            * 2
+        self.contrast_loss = contrastive_loss(input, target)
+        return torch.clamp(self.recon_loss - within_margin, min=0.0) + torch.clamp(
+            self.recon_loss - self.contrast_loss + between_margin, min=0.0
         )
 
     def forward(self, input, target):
@@ -331,3 +318,52 @@ class RCLossAnneal(nn.Module):
             within_margin=self.within_margin,
             between_margin=self.between_margin,
         )
+
+
+class CRRLoss(nn.Module):
+    """Contrast-Regularized Reconstruction Loss.
+
+    Parameters
+    ----------
+    margin : float, optional
+        The margin value for the reconstruction loss, by default 1.0
+    alpha : float, optional
+        The weight for the contrastive loss, by default 0.10
+    mask : torch.Tensor, optional
+        Mask tensor, by default None.
+
+    Returns
+    ----------
+    torch.float:
+        CRRLoss between target and input.
+    """
+
+    def __init__(self, margin=1.0, alpha=0.10, mask=None):
+        super().__init__()
+        self.margin = margin
+        self.alpha = alpha
+        self.recon_loss = None
+        self.contrast_loss = None
+        self.triplet_loss = None
+        self.mask = None
+        if mask is not None:
+            self.mask = MaskTensor(mask)
+
+    def _triplet_loss(self, input, target):
+        """Triplet Loss."""
+        recon_loss = F.mse_loss(input, target)
+        contrast_loss = contrastive_loss(input, target)
+        return (
+            recon_loss,
+            contrast_loss,
+            torch.clamp(recon_loss - contrast_loss + self.margin, min=0),
+        )
+
+    def forward(self, input, target):
+        if self.mask is not None:
+            input = self.mask.apply_mask(input)
+            target = self.mask.apply_mask(target)
+        self.recon_loss, self.contrast_loss, self.triplet_loss = self._triplet_loss(
+            input, target
+        )
+        return self.recon_loss + self.alpha * self.triplet_loss

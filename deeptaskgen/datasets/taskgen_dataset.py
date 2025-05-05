@@ -2,7 +2,7 @@ import os.path as op
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from .utils import _unmask_timeseries
 
@@ -15,6 +15,7 @@ def load_timeseries(
     unmask=False,
     mask=None,
     crop=False,
+    dtype=torch.float32,
 ):
     # Rest
     if not op.exists(rest_file):
@@ -27,21 +28,21 @@ def load_timeseries(
     if unmask:
         rest_img = (
             torch.from_numpy(_unmask_timeseries(np.load(rest_file).T, mask, crop))
-            .type(torch.float)
+            .type(dtype)
             .to(device)
         )
         if task_file is not None:
             task_img = (
                 torch.from_numpy(_unmask_timeseries(np.load(task_file), mask, crop))
-                .type(torch.float)
+                .type(dtype)
                 .to(device)
             )
             return rest_img, task_img
         return rest_img
     else:
-        rest_img = torch.from_numpy(np.load(rest_file)).type(torch.float).to(device)
+        rest_img = torch.from_numpy(np.load(rest_file)).type(dtype).to(device)
         if task_file is not None:
-            task_img = torch.from_numpy(np.load(task_file)).type(torch.float).to(device)
+            task_img = torch.from_numpy(np.load(task_file)).type(dtype).to(device)
             return rest_img, task_img
         return rest_img
 
@@ -69,6 +70,8 @@ class TaskGenDataset(Dataset):
         Mask array, by default None
     crop : bool, optional
         Crops the image to get rid of unnecessary blank spaces around the borders of brain, by default False.
+    precision : str, optional
+        Precision to use, by default "32"
 
     Returns
     ----------
@@ -86,6 +89,7 @@ class TaskGenDataset(Dataset):
         unmask=False,
         mask=None,
         crop=False,
+        precision="32",
     ) -> None:
         super().__init__()
         self.subj_ids = subj_ids
@@ -96,6 +100,14 @@ class TaskGenDataset(Dataset):
         self.unmask = unmask
         self.mask = mask
         self.crop = crop
+        self.precision = precision
+
+        if precision == "16":
+            self._dtype = torch.float16
+        elif precision == "bf16":
+            self._dtype = torch.bfloat16
+        else:
+            self._dtype = torch.float32
 
         if unmask and (mask is None):
             raise ValueError("Mask must be provided to unmask timeseries!")
@@ -112,98 +124,14 @@ class TaskGenDataset(Dataset):
             task_file = op.join(self.task_dir, f"{subj}_joint_MNI_task_contrasts.npy")
 
         return load_timeseries(
-            rest_file, task_file, self.device, self.unmask, self.mask, self.crop
+            rest_file,
+            task_file,
+            self.device,
+            self.unmask,
+            self.mask,
+            self.crop,
+            self._dtype,
         )
 
     def __len__(self):
         return len(self.subj_ids)
-
-
-class TaskGenDatasetLinear(TaskGenDataset):
-    """Dataset class for task generation experiment using simple linear regression method presented in Tavor et al., 2016."""
-
-    def __init__(
-        self,
-        subj_ids,
-        rest_dir,
-        task_dir=None,
-        num_samples=8,
-        device="cpu",
-        unmask=False,
-        mask=None,
-        crop=False,
-    ) -> None:
-        super().__init__(
-            subj_ids, rest_dir, task_dir, num_samples, device, unmask, mask, crop
-        )
-
-    def __getitem__(self, idx):
-        if self.task_dir is not None:
-            rest_data, task_data = super().__getitem__(idx)
-            return rest_data.flatten(1), task_data.flatten(1)
-        else:
-            rest_data = super().__getitem__(idx)
-            return rest_data.flatten(1)
-
-
-class AverageDataLoader(DataLoader):
-    """DataLoader that averages over the samples in a batch.
-
-    Parameters
-    ----------
-    PyTorch DataLoader arguments
-
-    Returns
-    ----------
-    torch.utils.data.DataLoader:
-        DataLoader object that averages over the samples in a batch.
-    """
-
-    def __init__(
-        self,
-        *args,
-        **kwargs,
-    ) -> None:
-        super().__init__(
-            *args,
-            **kwargs,
-        )
-
-    def __iter__(self):
-        for batch in super().__iter__():
-            for i in range(len(batch)):
-                batch[i] = torch.mean(batch[i], dim=0).unsqueeze(dim=0)
-            yield batch
-
-
-class ResidualizedDataloader(DataLoader):
-    """DataLoader that residualizes the samples in a batch.
-
-    Residualization is done by subtracting the mean of the
-    batch from each sample in the batch.
-
-    Parameters
-    ----------
-    PyTorch DataLoader arguments
-
-    Returns
-    ----------
-    torch.utils.data.DataLoader:
-        DataLoader object that residualizes the samples in a batch.
-    """
-
-    def __init__(
-        self,
-        *args,
-        **kwargs,
-    ) -> None:
-        super().__init__(
-            *args,
-            **kwargs,
-        )
-
-    def __iter__(self):
-        for batch in super().__iter__():
-            for i in range(len(batch)):
-                batch[i] = batch[i] - torch.mean(batch[i], dim=0).unsqueeze(dim=0)
-            yield batch

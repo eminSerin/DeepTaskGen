@@ -24,7 +24,7 @@ def call_layer(layer, dims):
     ValueError
         When dims is not 1, 2 or 3.
     """
-    if not dims in [1, 2, 3]:
+    if dims not in [1, 2, 3]:
         raise ValueError("Dimensions must be 1, 2 or 3")
     return getattr(nn, f"{layer}{dims}d")
 

@@ -2,6 +2,7 @@ import os
 import os.path as op
 from logging import warning
 
+import nibabel as nib
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -58,6 +59,14 @@ def predict(args):
         lr_scheduler=args.lr_scheduler,
     ).to(args.device)
 
+    # Masking
+    if args.pred_mask is not None:
+        pred_mask = torch.from_numpy(nib.load(args.pred_mask).get_fdata()).to(
+            args.device
+        )
+    else:
+        pred_mask = None
+
     """Predict"""
     print("Predicting...")
     model.eval()
@@ -79,6 +88,8 @@ def predict(args):
                             unmask=args.unmask,
                             device=args.device,
                         )
+                        if pred_mask is not None:
+                            img = img * pred_mask
                         pred_list.append(
                             model(img.unsqueeze(0)).cpu().detach().numpy().squeeze(0)
                         )
