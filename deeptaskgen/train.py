@@ -18,12 +18,11 @@ from deeptaskgen.callbacks.callbacks import (
     FinalLayerFreeze,
     LogGradients,
     LogParameters,
-    LogReconContrastLoss,
     RCLossMarginTune,
     SaveLastModel,
 )
 from deeptaskgen.datasets.taskgen_dataset import TaskGenDataset
-from deeptaskgen.losses.loss_metric import RCLossAnneal, RCLossV2
+from deeptaskgen.losses.loss_metric import RCLossAnneal
 from deeptaskgen.utils.parser import default_parser
 
 

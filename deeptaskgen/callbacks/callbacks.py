@@ -13,21 +13,6 @@ class RCLossMarginTune(Callback):
         pl_module.loss_fn.update_margins(trainer.current_epoch)
 
 
-class LogReconContrastLoss(Callback):
-    """Callback to log the reconstruction and contrastive loss."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        self.log("train/recon_loss", pl_module.loss_fn.recon_loss)
-        self.log("train/cont_loss", pl_module.loss_fn.contrast_loss)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        self.log("val/recon_loss", pl_module.loss_fn.recon_loss)
-        self.log("val/cont_loss", pl_module.loss_fn.contrast_loss)
-
-
 class SaveLastModel(Callback):
     """Callback to save the model at the end of training."""
 
